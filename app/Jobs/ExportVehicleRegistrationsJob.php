@@ -40,7 +40,7 @@ class ExportVehicleRegistrationsJob implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(): void
+    public function handle(): string
     {
         // Load template Excel
         $templatePath = storage_path('Vexe_Template.xlsx');
@@ -59,14 +59,14 @@ class ExportVehicleRegistrationsJob implements ShouldQueue
             ->get();
 
         if ($registrations->isEmpty()) {
-            return;
+            throw new \Exception('Không có dữ liệu để export');
         }
 
         // Tính số nhóm cần thiết (mỗi nhóm có 3 vé)
         $totalTickets = $registrations->count();
         $groupsNeeded = ceil($totalTickets / 3);
 
-        // TÌM VỊ TRÍ THỰC TẾ của các nhóm trong template (tự động phát hiện vị trí "VÉ GỬI XE")
+        // TÌM VỊ TRÍ THỰC TẾ của các nhóm trong template
         $groupPositions = [];
         $highestRow = $sheet->getHighestRow();
 
@@ -79,54 +79,81 @@ class ExportVehicleRegistrationsJob implements ShouldQueue
 
         $templateGroupCount = count($groupPositions);
 
-        // Nếu template không đủ nhóm, DUPLICATE thêm từ NHÓM 2
-        if ($templateGroupCount < $groupsNeeded) {
-            // Sử dụng NHÓM 2 làm mẫu (nếu có), nếu không có thì dùng nhóm 1
-            $sourceGroupIndex = ($templateGroupCount > 1) ? 1 : 0;
-            $sourceGroupStart = $groupPositions[$sourceGroupIndex];
+        // Số nhóm tối đa trên 1 sheet = số nhóm có sẵn trong template
+        $maxGroupsPerSheet = $templateGroupCount;
 
-            // Tính khoảng cách giữa các nhóm
-            $groupHeight = ($templateGroupCount > 1)
-                ? ($groupPositions[1] - $groupPositions[0])
-                : 9;
+        // Đặt tên cho sheet đầu tiên
+        $sheet->setTitle('Trang 1');
 
-            $lastGroupEnd = $groupPositions[$templateGroupCount - 1] + $groupHeight - 1;
+        // Nếu cần nhiều hơn template, tạo thêm sheet
+        $sheetsNeeded = ceil($groupsNeeded / $maxGroupsPerSheet);
+        $allSheets = [$sheet];
 
-            // Lưu thông tin ảnh từ nhóm mẫu (để clone sau)
-            $sourceImages = [];
-            foreach ($sheet->getDrawingCollection() as $drawing) {
-                $coords = $drawing->getCoordinates();
-                preg_match('/([A-Z]+)(\d+)/', $coords, $matches);
+        if ($sheetsNeeded > 1) {
+            // Clone sheet gốc để tạo thêm sheets
+            for ($sheetIndex = 1; $sheetIndex < $sheetsNeeded; $sheetIndex++) {
+                $newSheet = clone $sheet;
+                $newSheet->setTitle('Trang ' . ($sheetIndex + 1));
+                $spreadsheet->addSheet($newSheet);
+                $allSheets[] = $newSheet;
+            }
+        }
 
-                if (isset($matches[1]) && isset($matches[2])) {
-                    $col = $matches[1];
-                    $row = (int)$matches[2];
+        // Xử lý từng sheet
+        foreach ($allSheets as $sheetIndex => $currentSheet) {
+            // Tính số nhóm cần thiết cho sheet này
+            $groupsInThisSheet = min($maxGroupsPerSheet, $groupsNeeded - ($sheetIndex * $maxGroupsPerSheet));
 
-                    // Nếu ảnh thuộc nhóm mẫu
-                    if ($row >= $sourceGroupStart && $row < $sourceGroupStart + $groupHeight) {
-                        $rowOffset = $row - $sourceGroupStart;
+            if ($groupsInThisSheet <= 0) {
+                break;
+            }
 
-                        // Lưu thông tin ảnh để clone
-                        $sourceImages[] = [
-                            'col' => $col,
-                            'rowOffset' => $rowOffset,
-                            'drawing' => $drawing,
-                        ];
-                    }
+            // Tìm lại group positions cho sheet hiện tại
+            $sheetGroupPositions = [];
+            $sheetHighestRow = $currentSheet->getHighestRow();
+
+            for ($row = 1; $row <= $sheetHighestRow; $row++) {
+                $value = $currentSheet->getCell('A' . $row)->getValue();
+                if ($value === 'VÉ GỬI XE') {
+                    $sheetGroupPositions[] = $row;
                 }
             }
 
-            // Lưu merged cells vào array TRƯỚC để tránh lỗi "Worksheet no longer exists"
-            $mergedCellsArray = [];
-            foreach ($sheet->getMergeCells() as $mergeCell) {
-                $mergedCellsArray[] = $mergeCell;
-            }
+            $sheetTemplateGroupCount = count($sheetGroupPositions);
 
-            // Duplicate thêm các nhóm còn thiếu
-            for ($groupIndex = $templateGroupCount; $groupIndex < $groupsNeeded; $groupIndex++) {
-                $newGroupStart = $lastGroupEnd + 1 + (($groupIndex - $templateGroupCount) * $groupHeight);
+            // Nếu template không đủ nhóm cho sheet này, DUPLICATE thêm
+            if ($sheetTemplateGroupCount < $groupsInThisSheet) {
+                $sourceGroupIndex = ($sheetTemplateGroupCount > 1) ? 1 : 0;
+                $sourceGroupStart = $sheetGroupPositions[$sourceGroupIndex];
+
+                $groupHeight = ($sheetTemplateGroupCount > 1)
+                    ? ($sheetGroupPositions[1] - $sheetGroupPositions[0])
+                    : 9;
+
+                $lastGroupEnd = $sheetGroupPositions[$sheetTemplateGroupCount - 1] + $groupHeight - 1;
+
+                // Lưu thông tin ảnh từ nhóm mẫu
+                $sourceImages = [];
+                foreach ($currentSheet->getDrawingCollection() as $drawing) {
+                    $coords = $drawing->getCoordinates();
+                    preg_match('/([A-Z]+)(\d+)/', $coords, $matches);
+
+                    if ($matches) {
+                        $row = (int)$matches[2];
+                        if ($row >= $sourceGroupStart && $row < ($sourceGroupStart + $groupHeight)) {
+                            $sourceImages[] = [
+                                'drawing' => $drawing,
+                                'offset' => $row - $sourceGroupStart,
+                            ];
+                        }
+                    }
+                }
+
+                // Lưu merged cells vào array TRƯỚC KHI iterate
+                $mergedCellsArray = $currentSheet->getMergeCells();
 
                 // Copy merged cells TRƯỚC để giữ nguyên structure
+                $mergedCellsToAdd = [];
                 foreach ($mergedCellsArray as $mergeCell) {
                     if (preg_match('/([A-Z]+)(\d+):([A-Z]+)(\d+)/', $mergeCell, $matches)) {
                         $startCol = $matches[1];
@@ -134,134 +161,162 @@ class ExportVehicleRegistrationsJob implements ShouldQueue
                         $endCol = $matches[3];
                         $endRow = (int)$matches[4];
 
-                        // Nếu merge cell thuộc nhóm mẫu
                         if ($startRow >= $sourceGroupStart && $startRow < $sourceGroupStart + $groupHeight) {
                             $rowOffset = $startRow - $sourceGroupStart;
-                            $newStartRow = $newGroupStart + $rowOffset;
-                            $newEndRow = $newStartRow + ($endRow - $startRow);
+                            $rowEndOffset = $endRow - $sourceGroupStart;
 
-                            try {
-                                $sheet->mergeCells($startCol . $newStartRow . ':' . $endCol . $newEndRow);
-                            } catch (\Exception $e) {
-                                // Ignore nếu đã merge hoặc conflict
+                            for ($groupIndex = $sheetTemplateGroupCount; $groupIndex < $groupsInThisSheet; $groupIndex++) {
+                                $newGroupStart = $lastGroupEnd + 1 + (($groupIndex - $sheetTemplateGroupCount) * $groupHeight);
+                                $newStartRow = $newGroupStart + $rowOffset;
+                                $newEndRow = $newGroupStart + $rowEndOffset;
+                                $mergedCellsToAdd[] = $startCol . $newStartRow . ':' . $endCol . $newEndRow;
                             }
                         }
                     }
                 }
 
-                // Copy từng dòng từ nhóm mẫu
-                for ($rowOffset = 0; $rowOffset < $groupHeight; $rowOffset++) {
-                    $sourceRow = $sourceGroupStart + $rowOffset;
-                    $targetRow = $newGroupStart + $rowOffset;
+                // Duplicate thêm các nhóm còn thiếu
+                for ($groupIndex = $sheetTemplateGroupCount; $groupIndex < $groupsInThisSheet; $groupIndex++) {
+                    $newGroupStart = $lastGroupEnd + 1 + (($groupIndex - $sheetTemplateGroupCount) * $groupHeight);
 
-                    // Copy row height
-                    $sheet->getRowDimension($targetRow)
-                        ->setRowHeight($sheet->getRowDimension($sourceRow)->getRowHeight());
+                    // Copy từng dòng từ nhóm mẫu
+                    for ($rowOffset = 0; $rowOffset < $groupHeight; $rowOffset++) {
+                        $sourceRow = $sourceGroupStart + $rowOffset;
+                        $targetRow = $newGroupStart + $rowOffset;
 
-                    // Copy từng cell với style đầy đủ
-                    foreach (range('A', 'I') as $col) {
-                        $sourceCellCoord = $col . $sourceRow;
-                        $targetCellCoord = $col . $targetRow;
+                        // Copy row height
+                        $currentSheet->getRowDimension($targetRow)
+                            ->setRowHeight($currentSheet->getRowDimension($sourceRow)->getRowHeight());
 
-                        // Copy value (chỉ label, không copy data B, E, H)
-                        if (!in_array($col, ['B', 'E', 'H'])) {
-                            $sheet->setCellValue($targetCellCoord, $sheet->getCell($sourceCellCoord)->getValue());
-                        }
+                        // Copy từng cell với style đầy đủ
+                        foreach (range('A', 'I') as $col) {
+                            $sourceCellCoord = $col . $sourceRow;
+                            $targetCellCoord = $col . $targetRow;
 
-                        // Copy style bằng duplicateStyle (giữ nguyên border)
-                        $sheet->duplicateStyle(
-                            $sheet->getStyle($sourceCellCoord),
-                            $targetCellCoord
-                        );
-                    }
-                }
+                            // Copy value (chỉ label, không copy data B, E, H)
+                            if (!in_array($col, ['B', 'E', 'H'])) {
+                                $currentSheet->setCellValue($targetCellCoord, $currentSheet->getCell($sourceCellCoord)->getValue());
+                            }
 
-                // Copy MERGE CELLS từ source group sang target group
-                $sourceMergeCells = $sheet->getMergeCells();
-                foreach ($sourceMergeCells as $mergeRange) {
-                    // Parse merge range (ví dụ: "A82:C82")
-                    preg_match('/([A-Z]+)(\d+):([A-Z]+)(\d+)/', $mergeRange, $matches);
-                    if ($matches) {
-                        $startCol = $matches[1];
-                        $startRow = (int)$matches[2];
-                        $endCol = $matches[3];
-                        $endRow = (int)$matches[4];
-
-                        // Kiểm tra nếu merge range nằm trong source group
-                        if ($startRow >= $sourceGroupStart && $endRow < ($sourceGroupStart + $groupHeight)) {
-                            // Tính offset
-                            $rowOffset = $startRow - $sourceGroupStart;
-                            $rowEndOffset = $endRow - $sourceGroupStart;
-
-                            // Tạo merge range mới cho target group
-                            $newMergeRange = $startCol . ($newGroupStart + $rowOffset) . ':' .
-                                           $endCol . ($newGroupStart + $rowEndOffset);
-
-                            // Merge cells trong target group
-                            $sheet->mergeCells($newMergeRange);
+                            // Copy style bằng duplicateStyle
+                            $currentSheet->duplicateStyle(
+                                $currentSheet->getStyle($sourceCellCoord),
+                                $targetCellCoord
+                            );
                         }
                     }
-                }
 
-                // Copy column width (chỉ cần copy 1 lần)
-                if ($groupIndex == $templateGroupCount) {
-                    foreach (range('A', 'I') as $col) {
-                        $sheet->getColumnDimension($col)
-                            ->setWidth($sheet->getColumnDimension($col)->getWidth());
+                    // Copy column width (chỉ cần copy 1 lần)
+                    if ($groupIndex == $sheetTemplateGroupCount) {
+                        foreach (range('A', 'I') as $col) {
+                            $currentSheet->getColumnDimension($col)
+                                ->setWidth($currentSheet->getColumnDimension($col)->getWidth());
+                        }
+                    }
+
+                    // Clone ảnh cho nhóm mới
+                    foreach ($sourceImages as $imageInfo) {
+                        $sourceDrawing = $imageInfo['drawing'];
+                        $offset = $imageInfo['offset'];
+
+                        $newDrawing = clone $sourceDrawing;
+                        $newRow = $newGroupStart + $offset;
+
+                        preg_match('/([A-Z]+)(\d+)/', $sourceDrawing->getCoordinates(), $matches);
+                        $col = $matches[1];
+
+                        $newDrawing->setCoordinates($col . $newRow);
+                        $newDrawing->setWorksheet($currentSheet);
                     }
                 }
 
-                // Clone ảnh/logo cho nhóm mới
-                foreach ($sourceImages as $imageInfo) {
+                // Merge cells cho các nhóm mới
+                foreach ($mergedCellsToAdd as $mergeRange) {
                     try {
-                        $drawing = $imageInfo['drawing'];
-                        $newRow = $newGroupStart + $imageInfo['rowOffset'];
-                        $newCoords = $imageInfo['col'] . $newRow;
-
-                        // Clone drawing
-                        $newDrawing = clone $drawing;
-                        $newDrawing->setCoordinates($newCoords);
-                        $newDrawing->setWorksheet($sheet);
+                        $currentSheet->mergeCells($mergeRange);
                     } catch (\Exception $e) {
-                        // Ignore nếu không clone được
-                    }
-                }
-
-                // Thêm vào danh sách vị trí nhóm
-                $groupPositions[] = $newGroupStart;
-            }
-        }
-
-        // Xóa dữ liệu cũ từ template gốc (chỉ xóa các nhóm template ban đầu)
-        // Các nhóm duplicate đã không copy data B, E, H nên không cần xóa
-        foreach ($groupPositions as $index => $groupStart) {
-            // Chỉ xóa các nhóm template gốc (không phải duplicate)
-            if ($index < $templateGroupCount) {
-                for ($offset = 1; $offset <= 5; $offset++) {
-                    foreach (['B', 'E', 'H'] as $col) {
-                        $sheet->setCellValue($col . ($groupStart + $offset), null);
+                        // Ignore nếu đã merge hoặc conflict
                     }
                 }
             }
         }
 
-        // ĐIỀN DỮ LIỆU vào từng vé (sử dụng vị trí thực tế từ template)
-        foreach ($registrations as $index => $registration) {
-            $groupIndex = floor($index / 3);
-            $positionInGroup = $index % 3;
+        // ĐIỀN DỮ LIỆU vào các vé trên tất cả sheets
+        $ticketIndex = 0;
+        foreach ($registrations as $registration) {
+            // Tính sheet nào và group nào
+            $sheetIndex = floor($ticketIndex / ($maxGroupsPerSheet * 3));
+            $ticketInSheet = $ticketIndex % ($maxGroupsPerSheet * 3);
+            $groupInSheet = floor($ticketInSheet / 3);
+            $positionInGroup = $ticketInSheet % 3;
 
-            // Xác định cột data
-            $valueCol = ['B', 'E', 'H'][$positionInGroup];
+            if ($sheetIndex >= count($allSheets)) {
+                break;
+            }
 
-            // Lấy vị trí thực tế của nhóm từ template
-            $groupStartRow = $groupPositions[$groupIndex];
+            $currentSheet = $allSheets[$sheetIndex];
 
-            // Điền dữ liệu (offset từ dòng "VÉ GỬI XE")
-            $sheet->setCellValue($valueCol . ($groupStartRow + 1), $registration->so_ve_xe ?: '');
-            $sheet->setCellValue($valueCol . ($groupStartRow + 2), $registration->ho_va_ten ?: '');
-            $sheet->setCellValue($valueCol . ($groupStartRow + 3), $registration->lop ?: '');
-            $sheet->setCellValue($valueCol . ($groupStartRow + 4), $registration->bien_so ?: '');
-            $sheet->setCellValue($valueCol . ($groupStartRow + 5), $registration->loai_xe ?: '');
+            // Tìm lại group positions cho sheet hiện tại
+            $sheetGroupPositions = [];
+            for ($row = 1; $row <= $currentSheet->getHighestRow(); $row++) {
+                $value = $currentSheet->getCell('A' . $row)->getValue();
+                if ($value === 'VÉ GỬI XE') {
+                    $sheetGroupPositions[] = $row;
+                }
+            }
+
+            if ($groupInSheet >= count($sheetGroupPositions)) {
+                break;
+            }
+
+            $groupStartRow = $sheetGroupPositions[$groupInSheet];
+            $colOffset = $positionInGroup * 3;
+            $dataCol = chr(66 + $colOffset);
+
+            // Điền dữ liệu vào cột tương ứng (B, E, hoặc H)
+            $currentSheet->setCellValue($dataCol . ($groupStartRow + 1), $registration->so_ve_xe ?? '');
+            $currentSheet->setCellValue($dataCol . ($groupStartRow + 2), $registration->ho_va_ten ?? '');
+            $currentSheet->setCellValue($dataCol . ($groupStartRow + 3), $registration->lop ?? '');
+            $currentSheet->setCellValue($dataCol . ($groupStartRow + 4), $registration->bien_so ?? '');
+            $currentSheet->setCellValue($dataCol . ($groupStartRow + 5), $registration->loai_xe ?? '');
+
+            $ticketIndex++;
+        }
+
+        // Xóa data từ các vé template không dùng trên tất cả sheets
+        foreach ($allSheets as $sheetIndex => $currentSheet) {
+            // Tìm lại group positions cho sheet hiện tại
+            $sheetGroupPositions = [];
+            for ($row = 1; $row <= $currentSheet->getHighestRow(); $row++) {
+                $value = $currentSheet->getCell('A' . $row)->getValue();
+                if ($value === 'VÉ GỬI XE') {
+                    $sheetGroupPositions[] = $row;
+                }
+            }
+
+            $startTicketIndex = $sheetIndex * $maxGroupsPerSheet * 3;
+            $endTicketIndex = min($startTicketIndex + ($maxGroupsPerSheet * 3), $totalTickets);
+
+            // Xóa data từ các vé không dùng trong sheet này
+            for ($i = $endTicketIndex; $i < $startTicketIndex + (count($sheetGroupPositions) * 3); $i++) {
+                $ticketInSheet = $i - $startTicketIndex;
+                $groupInSheet = floor($ticketInSheet / 3);
+                $positionInGroup = $ticketInSheet % 3;
+
+                if ($groupInSheet >= count($sheetGroupPositions)) {
+                    break;
+                }
+
+                $groupStartRow = $sheetGroupPositions[$groupInSheet];
+                $colOffset = $positionInGroup * 3;
+                $dataCol = chr(66 + $colOffset);
+
+                $currentSheet->setCellValue($dataCol . ($groupStartRow + 1), '');
+                $currentSheet->setCellValue($dataCol . ($groupStartRow + 2), '');
+                $currentSheet->setCellValue($dataCol . ($groupStartRow + 3), '');
+                $currentSheet->setCellValue($dataCol . ($groupStartRow + 4), '');
+                $currentSheet->setCellValue($dataCol . ($groupStartRow + 5), '');
+            }
         }
 
         // Lưu file
@@ -276,7 +331,8 @@ class ExportVehicleRegistrationsJob implements ShouldQueue
         $writer = new Xlsx($spreadsheet);
         $writer->save($filePath);
 
-        // TODO: Có thể notify user qua notification/event khi export xong
+        // Trả về đường dẫn file để controller tải về
+        return $filePath;
     }
 }
 
