@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\VehicleRegistrationController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -13,6 +14,9 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
-Route::get('/', function () {
-    return view('welcome');
-});
+// Vehicle Registration Routes
+Route::get('/', [VehicleRegistrationController::class, 'index'])->name('vehicle-registrations.index');
+Route::post('/vehicle-registrations/import', [VehicleRegistrationController::class, 'import'])->name('vehicle-registrations.import');
+Route::get('/vehicle-registrations/available-months', [VehicleRegistrationController::class, 'getAvailableMonths'])->name('vehicle-registrations.available-months');
+Route::post('/vehicle-registrations/export', [VehicleRegistrationController::class, 'export'])->name('vehicle-registrations.export');
+Route::delete('/vehicle-registrations/delete-all', [VehicleRegistrationController::class, 'deleteAll'])->name('vehicle-registrations.delete-all');
